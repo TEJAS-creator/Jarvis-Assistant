@@ -66,6 +66,19 @@ def get_project_name(target_dir: str = None) -> str:
     name = os.path.basename(repo.rstrip("\\/"))
     return name if name else "Jarvis-Core"
 
+def is_online(host: str = "8.8.8.8", port: int = 53, timeout: float = 1.0) -> bool:
+    """Checks whether the machine has active internet connectivity."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (OSError, socket.timeout):
+        pass
+    try:
+        with socket.create_connection(("1.1.1.1", 53), timeout=timeout):
+            return True
+    except (OSError, socket.timeout):
+        return False
+
 def is_n8n_online(host: str = "localhost", port: int = 5678, timeout: float = 0.8) -> bool:
     """Checks whether n8n workflow engine is responding on the local port."""
     try:

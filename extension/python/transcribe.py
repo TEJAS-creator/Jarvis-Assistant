@@ -13,6 +13,11 @@ import warnings
 import requests
 from dotenv import load_dotenv
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # Suppress HuggingFace hub symlink warnings on Windows
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 warnings.filterwarnings("ignore")
@@ -21,6 +26,8 @@ load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 TRANSCRIPT_CACHE_FILE = os.path.join(PROJECT_ROOT, "last_transcript.txt")
+
+from jarvis_config import is_online
 
 def sanitize_transcript(text: str) -> str:
     """Removes irregular newlines, control characters, and excess whitespace."""
@@ -31,7 +38,7 @@ def sanitize_transcript(text: str) -> str:
     return cleaned
 
 def transcribe_with_groq(audio_path: str) -> str:
-    """Primary ASR: Groq Cloud API whisper-large-v3-turbo."""
+    """Primary Online ASR: Groq Cloud API whisper-large-v3-turbo."""
     if not GROQ_API_KEY or GROQ_API_KEY.startswith("your_"):
         raise ValueError("GROQ_API_KEY is not configured.")
 
@@ -47,7 +54,9 @@ def transcribe_with_groq(audio_path: str) -> str:
         data = {
             "model": "whisper-large-v3-turbo",
             "temperature": "0.0",
+            "language": "en",
             "response_format": "json",
+            "prompt": "Jarvis developer voice assistant for Git operations, software engineering, and workspace commands: create branch, testing, checkout, commit, push, revert, status, diff, repository, repo, Antigravity, GitHub, Python, code.",
         }
         response = requests.post(url, headers=headers, files=files, data=data, timeout=15)
 
@@ -57,16 +66,47 @@ def transcribe_with_groq(audio_path: str) -> str:
     else:
         raise RuntimeError(f"Groq Whisper HTTP {response.status_code}: {response.text}")
 
+def transcribe_with_speech_recognition(audio_path: str) -> str:
+    """Offline & Normal Speech Recognition fallback using SpeechRecognition library."""
+    import speech_recognition as sr
+    recognizer = sr.Recognizer()
+
+    with sr.AudioFile(audio_path) as source:
+        audio_data = recognizer.record(source)
+
+    # 1. If network is alive (e.g., Groq was specifically rate-limited or failed), try standard Google SR
+    if is_online():
+        try:
+            text = recognizer.recognize_google(audio_data)
+            if text:
+                return sanitize_transcript(text)
+        except sr.UnknownValueError:
+            return ""
+        except Exception as e:
+            print(f"[transcribe.py] SpeechRecognition Google SR notice ({e}), trying local offline engine...", file=sys.stderr)
+
+    # 2. Local offline speech recognition: local tiny model via speech_recognition (100% offline, CPU)
+    try:
+        text = recognizer.recognize_whisper(audio_data, model="tiny")
+        if text:
+            return sanitize_transcript(text)
+    except Exception as e:
+        print(f"[transcribe.py] Local speech recognition error: {e}", file=sys.stderr)
+
+    return ""
+
 def transcribe_with_faster_whisper(audio_path: str) -> str:
-    """Offline Fallback ASR: Local faster-whisper tiny.en."""
+    """Secondary Fallback ASR: Local faster-whisper tiny.en."""
     from faster_whisper import WhisperModel
 
     model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
     segments, _ = model.transcribe(
         audio_path,
+        language="en",
         beam_size=5,
         vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=400),
+        initial_prompt="Jarvis developer voice assistant for Git operations: create branch, testing, checkout, commit, push, revert, status, repository, repo.",
+        vad_parameters=dict(min_silence_duration_ms=300),
     )
     text_parts = [segment.text.strip() for segment in segments]
     return sanitize_transcript(" ".join(text_parts))
@@ -76,19 +116,30 @@ def transcribe(audio_path: str) -> str:
         print(f"[transcribe.py] Warning: File not found: {audio_path}", file=sys.stderr)
         return ""
 
-    # 1. Primary: Groq Cloud API
+    # 1. Primary: Groq Cloud Whisper (used whenever online)
+    if is_online():
+        try:
+            text = transcribe_with_groq(audio_path)
+            if text:
+                return text
+        except Exception as e:
+            print(f"[transcribe.py] Groq Whisper notice ({e}), switching to normal speech recognition...", file=sys.stderr)
+    else:
+        print("[transcribe.py] Offline mode detected: bypassing Groq, using normal speech recognition...", file=sys.stderr)
+
+    # 2. Offline Fallback: Normal Speech Recognition
     try:
-        text = transcribe_with_groq(audio_path)
+        text = transcribe_with_speech_recognition(audio_path)
         if text:
             return text
     except Exception as e:
-        print(f"[transcribe.py] Groq Whisper notice ({e}), falling back to local faster-whisper...", file=sys.stderr)
+        print(f"[transcribe.py] Normal speech recognition notice: {e}", file=sys.stderr)
 
-    # 2. Offline Fallback: Local faster-whisper
+    # 3. Secondary Fallback: faster-whisper if available
     try:
         return transcribe_with_faster_whisper(audio_path)
     except Exception as e:
-        print(f"[transcribe.py] Local faster-whisper notice: {e}", file=sys.stderr)
+        print(f"[transcribe.py] faster-whisper notice: {e}", file=sys.stderr)
         return ""
 
 def main():

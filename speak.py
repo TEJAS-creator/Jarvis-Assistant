@@ -17,6 +17,11 @@ import uuid
 import asyncio
 import re
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # Suppress Pygame welcome banner
 os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
 
@@ -80,9 +85,63 @@ def ensure_static_audio():
             except Exception as e:
                 print(f"[speak.py] Static clip generation warning ({os.path.basename(path)}): {e}", file=sys.stderr)
 
+STOP_FLAG_FILE = os.path.join(PROJECT_ROOT, "jarvis_stop.flag")
+
+def stop_all_speech():
+    """Immediately stops all active speech playback, kills running speak.py processes, and sets stop flag."""
+    print("[speak.py] Emergency stop requested: halting all speech.", flush=True)
+    try:
+        with open(STOP_FLAG_FILE, "w", encoding="utf-8") as f:
+            f.write(str(time.time()))
+    except Exception:
+        pass
+
+    try:
+        import pygame
+        if pygame.mixer.get_init():
+            pygame.mixer.music.stop()
+            pygame.mixer.quit()
+    except Exception:
+        pass
+
+    # Terminate any other background speak.py processes safely
+    try:
+        import psutil
+        curr_pid = os.getpid()
+        for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                if p.pid == curr_pid:
+                    continue
+                pname = (p.name() or "").lower()
+                if not ("python" in pname or "py.exe" in pname):
+                    continue
+                cmdline = [c.lower() for c in (p.cmdline() or [])]
+                if "--stop" in cmdline:
+                    continue
+                if any("speak.py" in c for c in cmdline):
+                    p.terminate()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Update last_status.txt
+    try:
+        status_file = os.path.join(PROJECT_ROOT, "last_status.txt")
+        with open(status_file, "w", encoding="utf-8") as f:
+            f.write("[STOPPED] Speech halted by user.")
+    except Exception:
+        pass
+    print("[speak.py] All speech halted.", flush=True)
+
 def play_audio_file(audio_path: str):
     """Plays audio via pre-warmed 24kHz pygame mixer and releases stream immediately."""
     if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+        return
+
+    # Check if stop is requested before starting
+    if os.path.exists(STOP_FLAG_FILE):
+        cleanup_file(audio_path)
         return
 
     import pygame
@@ -93,6 +152,10 @@ def play_audio_file(audio_path: str):
         pygame.mixer.music.load(audio_path)
         pygame.mixer.music.play()
         while pygame.mixer.music.get_busy():
+            if os.path.exists(STOP_FLAG_FILE):
+                print("[TTS] Stop flag detected. Aborting playback immediately.", flush=True)
+                pygame.mixer.music.stop()
+                break
             time.sleep(0.02)
         pygame.mixer.music.stop()
         if hasattr(pygame.mixer.music, "unload"):
@@ -131,6 +194,13 @@ def speak_direct(text: str):
     if not clean:
         return
 
+    # Clear any previous stop flag before starting new speech
+    try:
+        if os.path.exists(STOP_FLAG_FILE):
+            os.remove(STOP_FLAG_FILE)
+    except Exception:
+        pass
+
     # Logging to console
     print(f"[TTS] Speaking: {clean}", flush=True)
 
@@ -157,6 +227,16 @@ def speak_direct(text: str):
     except Exception as e:
         print(f"[TTS] edge-tts error: {e}", file=sys.stderr)
         cleanup_file(temp_audio_file)
+        # Offline TTS fallback using local Windows SAPI5 / pyttsx3
+        try:
+            print("[TTS] Falling back to offline pyttsx3 voice engine...", file=sys.stderr)
+            import pyttsx3
+            engine = pyttsx3.init()
+            engine.setProperty("rate", 185)
+            engine.say(clean)
+            engine.runAndWait()
+        except Exception as pyttsx_err:
+            print(f"[TTS] pyttsx3 offline speech error: {pyttsx_err}", file=sys.stderr)
 
 def resolve_phrase_from_args() -> str:
     """Resolves target phrase from CLI flags, intent files, or string arguments."""
@@ -165,6 +245,11 @@ def resolve_phrase_from_args() -> str:
         return "Neural AI speech engine is online, sir."
 
     first_arg = args[0].strip()
+
+    # Emergency stop command
+    if first_arg.lower() in ["--stop", "stop", "jarvis stop"]:
+        stop_all_speech()
+        sys.exit(0)
 
     # File flag
     if first_arg == "--file" and len(args) > 1:
@@ -245,6 +330,10 @@ def resolve_phrase_from_args() -> str:
     return raw_joined
 
 def main():
+    if "--stop" in sys.argv or "-stop" in sys.argv:
+        stop_all_speech()
+        sys.exit(0)
+
     if "--init" in sys.argv:
         ensure_static_audio()
         sys.exit(0)
